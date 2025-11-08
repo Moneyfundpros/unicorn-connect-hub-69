@@ -71,9 +71,11 @@ async function conductMarketResearch(scanId: string, authHeader: string) {
       .single();
 
     if (scanError) {
+      console.error(`Failed to fetch scan ${scanId}:`, scanError);
       throw scanError;
     }
 
+    console.log(`Fetched scan data for ${scan.url}`);
     const domain = new URL(scan.url).hostname;
     
     // Extract industry/niche from domain or content
@@ -86,10 +88,13 @@ async function conductMarketResearch(scanId: string, authHeader: string) {
 
     let allSources = [];
     let researchData = {};
+    let tavilySuccessCount = 0;
 
     // Conduct research with Tavily
+    console.log(`Starting Tavily research with ${researchQueries.length} queries`);
     for (const query of researchQueries) {
       try {
+        console.log(`Executing Tavily query: "${query}"`);
         const tavilyResponse = await fetch('https://api.tavily.com/search', {
           method: 'POST',
           headers: {
@@ -103,19 +108,46 @@ async function conductMarketResearch(scanId: string, authHeader: string) {
           })
         });
 
+        console.log(`Tavily response status for "${query}": ${tavilyResponse.status}`);
+
         if (tavilyResponse.ok) {
           const data = await tavilyResponse.json();
-          if (data.results) {
+          if (data.results && data.results.length > 0) {
             allSources.push(...data.results);
             researchData[query] = data.results;
+            tavilySuccessCount++;
+            console.log(`Tavily query "${query}" returned ${data.results.length} results`);
+          } else {
+            console.warn(`Tavily query "${query}" returned no results`);
           }
+        } else {
+          const errorText = await tavilyResponse.text();
+          console.error(`Tavily API error for query "${query}": ${tavilyResponse.status} - ${errorText}`);
         }
       } catch (error) {
-        console.error(`Error with Tavily query "${query}":`, error);
+        console.error(`Exception with Tavily query "${query}":`, error instanceof Error ? error.message : error);
       }
     }
 
+    console.log(`Tavily research completed: ${tavilySuccessCount}/${researchQueries.length} queries successful, ${allSources.length} total sources`);
+
+    // Check if we have any research data
+    if (allSources.length === 0) {
+      console.error(`No research data collected from Tavily for scan ${scanId}`);
+      // Store empty insights to indicate the attempt was made but failed
+      await supabase
+        .from('market_insights')
+        .insert({
+          scan_id: scanId,
+          model: 'gemini-1.5-flash',
+          insights: { error: 'No research data available from Tavily API' },
+          sources: []
+        });
+      return;
+    }
+
     // Analyze research with Gemini
+    console.log(`Starting Gemini analysis with ${allSources.length} sources`);
     const analysisPrompt = `
       Based on the following market research data, provide insights for the website ${scan.url}:
 
@@ -137,7 +169,10 @@ async function conductMarketResearch(scanId: string, authHeader: string) {
     `;
 
     try {
-      const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${googleApiKey}`, {
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${googleApiKey}`;
+      console.log(`Calling Gemini API at: ${geminiUrl.replace(googleApiKey, 'REDACTED')}`);
+      
+      const geminiResponse = await fetch(geminiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -157,42 +192,96 @@ async function conductMarketResearch(scanId: string, authHeader: string) {
         })
       });
 
-      if (geminiResponse.ok) {
-        const result = await geminiResponse.json();
-        const analysisText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      console.log(`Gemini API response status: ${geminiResponse.status}`);
 
-        if (analysisText) {
-          let insights;
-          try {
-            const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              insights = JSON.parse(jsonMatch[0]);
-            } else {
-              insights = { raw_analysis: analysisText };
-            }
-          } catch (parseError) {
+      if (!geminiResponse.ok) {
+        const errorText = await geminiResponse.text();
+        console.error(`Gemini API error: ${geminiResponse.status} - ${errorText}`);
+        
+        // Store raw research data even if Gemini fails
+        await supabase
+          .from('market_insights')
+          .insert({
+            scan_id: scanId,
+            model: 'gemini-1.5-flash',
+            insights: { 
+              error: 'Gemini analysis failed',
+              raw_research_data: researchData 
+            },
+            sources: allSources
+          });
+        console.log(`Stored raw research data for scan ${scanId} despite Gemini failure`);
+        return;
+      }
+
+      const result = await geminiResponse.json();
+      console.log(`Gemini API response structure: ${JSON.stringify(Object.keys(result))}`);
+      
+      const analysisText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (analysisText) {
+        console.log(`Gemini returned analysis text (${analysisText.length} chars)`);
+        let insights;
+        try {
+          const jsonMatch = analysisText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            insights = JSON.parse(jsonMatch[0]);
+            console.log(`Successfully parsed Gemini JSON response`);
+          } else {
+            console.warn(`No JSON found in Gemini response, storing as raw analysis`);
             insights = { raw_analysis: analysisText };
           }
-
-          // Store market insights
-          await supabase
-            .from('market_insights')
-            .insert({
-              scan_id: scanId,
-              model: 'gemini-1.5-flash',
-              insights: insights,
-              sources: allSources
-            });
-
-          console.log(`Market research completed for scan ${scanId}`);
+        } catch (parseError) {
+          console.error(`Failed to parse Gemini JSON:`, parseError instanceof Error ? parseError.message : parseError);
+          insights = { raw_analysis: analysisText };
         }
+
+        // Store market insights
+        const { error: insertError } = await supabase
+          .from('market_insights')
+          .insert({
+            scan_id: scanId,
+            model: 'gemini-1.5-flash',
+            insights: insights,
+            sources: allSources
+          });
+
+        if (insertError) {
+          console.error(`Failed to insert market insights for scan ${scanId}:`, insertError);
+        } else {
+          console.log(`Market research completed successfully for scan ${scanId}`);
+        }
+      } else {
+        console.error(`Gemini returned no analysis text for scan ${scanId}`);
+        // Store sources even if no analysis
+        await supabase
+          .from('market_insights')
+          .insert({
+            scan_id: scanId,
+            model: 'gemini-1.5-flash',
+            insights: { error: 'No analysis text returned from Gemini' },
+            sources: allSources
+          });
       }
 
     } catch (apiError) {
-      console.error(`Error with Gemini analysis:`, apiError);
+      console.error(`Exception with Gemini analysis for scan ${scanId}:`, apiError instanceof Error ? apiError.message : apiError);
+      // Store raw research data as fallback
+      await supabase
+        .from('market_insights')
+        .insert({
+          scan_id: scanId,
+          model: 'gemini-1.5-flash',
+          insights: { 
+            error: 'Gemini API exception',
+            raw_research_data: researchData 
+          },
+          sources: allSources
+        });
     }
 
   } catch (error) {
-    console.error(`Error in conductMarketResearch for scan ${scanId}:`, error);
+    console.error(`Fatal error in conductMarketResearch for scan ${scanId}:`, error instanceof Error ? error.message : error);
+    console.error(`Error stack:`, error instanceof Error ? error.stack : 'No stack trace');
   }
 }
